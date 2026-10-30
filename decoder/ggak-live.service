@@ -1,0 +1,15 @@
+[Unit]
+Description=GGAK live decoder (Elektro-L5 1693 MHz; owns rtl_tcp on 127.0.0.1:1234)
+After=network.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/ggak_live
+Environment=GGAK_GAIN_TENTHS=450
+ExecStart=/usr/bin/python3 /home/pi/ggak_live/ggak_live.py
+Restart=always
+RestartSec=10
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

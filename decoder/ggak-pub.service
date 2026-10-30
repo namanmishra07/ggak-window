@@ -1,0 +1,14 @@
+[Unit]
+Description=GGAK publisher (ggak/l5/sec + status -> MQTT, daily jsonl archive)
+After=network-online.target ggak-live.service
+Wants=network-online.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/ggak_live
+ExecStart=/usr/bin/python3 /home/pi/ggak_live/ggak_pub.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
