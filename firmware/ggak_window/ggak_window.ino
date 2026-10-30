@@ -32,9 +32,11 @@
 //
 // Data source (Auto by default, can be forced from the page; the choice resets to Auto on every boot):
 //   1. LIVE   : our own L5 decode via the broker, while it has delivered a non-null count in the last 5 min
-//   2. REPLAY : else Elektro-L2 SKL protons 9-300 MeV from SINP (ftp.sinp.msu.ru, 10 s rows) for the newest
-//               day with >= 50 % coverage among the last 3, played at the same UTC time of day. Labelled
-//               REPLAY on the OLED and the page. Downloaded in a background task, refreshed every 3 h.
+//   2. REPLAY : else this station's own recorded L5 particle rates at the same UTC time of day (retained
+//               table on ggak/l5/replay, refreshed by the Pi every 10 min). Labelled REPLAY.
+// What the light is: the GGAK counter channel the community decoder calls "protons > 600 MeV". Our data
+// says those are real particle counts (doubled Poisson, ~40/s) but probably NOT >600 MeV protons (they
+// don't follow GOES >500 MeV protons). So everything here says "particles", never "protons".
 //   3. TEST   : else local random data, labelled TEST.
 //
 // Boot order: Wi-Fi is joined first (up to 20 s, OLED says so), then the web page + OTA start, then LEDs/feed.
@@ -50,7 +52,7 @@
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
-#include <HTTPClient.h>
+#include <mbedtls/base64.h>
 #include <time.h>
 #include <math.h>
 
@@ -68,6 +70,7 @@ static const char* MQTT_USER    = "ggak-public";
 static const char* MQTT_PASS    = "M27enNeGa2DH8w9";
 static const char* TOPIC_SEC    = "ggak/l5/sec";
 static const char* TOPIC_STATUS = "ggak/l5/status";
+static const char* TOPIC_REPLAY = "ggak/l5/replay";
 
 // DigiCert Global Root G2 (valid to 2038-01-15)
 // SHA-256 fingerprint CB:3C:CB:B7:60:31:E5:E0:13:8F:8D:D3:9A:23:F9:DE:47:FF:C3:5E:43:C1:14:4C:EA:27:D4:6A:5A:B1:CB:5F
@@ -249,12 +252,14 @@ void onSecond(int p600, int p800, int p1100, int frames, long rx, bool live) {
   if (p600 < 0 || p800 < 0 || p1100 < 0) return;          // null: nothing to show, nothing invented
   int t2 = p1100, t1 = p800 - p1100, t0 = p600 - p800;
   if (t0 < 0 || t1 < 0 || t2 < 0) return;                  // not nested: malformed, drop
-  recentN[recentHead] = p600; recentHead = (recentHead + 1) % 60; if (recentLen < 60) recentLen++;
-  if (live && rx > 0) baselineAdd(rx, p600);
-  spawnFlashes(p600, 1.0f);
+  int particles = p600 / 2;                                // raw values are doubled counts (var/mean = 2.00)
+  recentN[recentHead] = particles; recentHead = (recentHead + 1) % 60; if (recentLen < 60) recentLen++;
+  if (live && rx > 0) baselineAdd(rx, particles);
+  spawnFlashes(particles, 1.0f);
 }
 
 void mqttCallback(char* topic, byte* payload, unsigned int len) {
+  if (!strcmp(topic, TOPIC_REPLAY)) { onReplayTable(payload, len); return; }   // big: parse once, on its own
   JsonDocument doc;
   if (deserializeJson(doc, payload, len)) return;
   if (!strcmp(topic, TOPIC_STATUS)) {
@@ -287,119 +292,47 @@ void testTick() {
   onSecond(c, b, a, 1, 0, false);
 }
 
-// ---------- REPLAY: Elektro-L2 SKL protons from SINP, previous day, same UTC time of day ----------
-// File: https://ftp.sinp.msu.ru/electro_l2/skl/YYYY/MM/el2-skl_YYYYMMDD_10s.csv (~1.6 MB, 8640 rows of 10 s).
-// Columns (after the timestamp): 6 = p 9-20, 7 = p 20-40, 8 = p 40-110, 9 = p 110-300 MeV; -9.99999e+99 = missing.
-// One byte per 10 s (sum of those four, 255 = missing) -> 8.6 KB per day in RAM.
-static const char SINP_CA[] PROGMEM = R"EOF(
------BEGIN CERTIFICATE-----
-MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
-TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
-cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4
-WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJu
-ZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBY
-MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygc
-h77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+
-0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6U
-A5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sW
-T8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyH
-B5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UC
-B5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUv
-KBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWn
-OlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTn
-jh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbw
-qHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CI
-rU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNV
-HRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkq
-hkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZL
-ubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ
-3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KK
-NFtY2PwByVS5uCbMiogziUwthDyC3+6WVwW6LLv3xLfHTjuCvjHIInNzktHCgKQ5
-ORAzI4JMPJ+GslWYHb4phowim57iaztXOoJwTdwJx4nLCgdNbOhdjsnvzqvHu7Ur
-TkXWStAmzOVyyghqpZXjFaH3pO3JLF+l+/+sKAIuvtd7u+Nxe5AW0wdeRlN8NwdC
-jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc
-oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq
-4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA
-mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
-emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
------END CERTIFICATE-----
-)EOF";   // ISRG Root X1 (Let's Encrypt), valid to 2035-06-04
+// ---------- REPLAY: this station's own recorded L5 particle rates, same UTC time of day ----------
+// The Pi publishes a retained table on ggak/l5/replay every 10 min: 8640 x 10-s slots, value = mean true
+// particles/s (raw / 2), 255 = no data; each slot holds its most recent reading within 72 h. Empty slots
+// are filled here from the nearest recorded slot. Arrives over the same MQTT link as the live feed.
 const int  ROWS_PER_DAY = 8640;
-const int  REPLAY_MIN_ROWS = ROWS_PER_DAY / 2;
 uint8_t    replayBuf[2][ROWS_PER_DAY];
 volatile int replayCur = -1;               // which buffer is live, -1 = none yet
-char       replayDay[11] = "";             // YYYY-MM-DD of the loaded day
-volatile int replayRows = 0;
-float      replayMean = 0;                 // mean counts per row over the day, for the storm level
+char       replayDay[24] = "";             // when the Pi built the table (UTC)
+volatile int replayRows = 0;               // slots that held real data before gap filling
+float      replayMean = 0;                 // mean particles/s over the table, for the storm level
 volatile uint32_t replayFetchedMs = 0;
-char       replayErr[48] = "not fetched yet";
-portMUX_TYPE replayMux = portMUX_INITIALIZER_UNLOCKED;
+char       replayErr[48] = "waiting for table";
 
-// download + parse one day into buf; returns rows with data (0 if the file is missing), or -1 if unreachable
-int fetchSinpDay(time_t day, uint8_t* buf) {
-  struct tm tm; gmtime_r(&day, &tm);
-  char url[96];
-  snprintf(url, sizeof url, "https://ftp.sinp.msu.ru/electro_l2/skl/%04d/%02d/el2-skl_%04d%02d%02d_10s.csv",
-           tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
-  WiFiClientSecure tls; tls.setCACert(SINP_CA);
-  HTTPClient http; http.setTimeout(15000);
-  if (!http.begin(tls, url)) { snprintf(replayErr, sizeof replayErr, "begin failed"); return -1; }
-  int code = http.GET();
-  if (code != 200) {                               // < 0: no connection (retry later); 404 etc: try an older day
-    snprintf(replayErr, sizeof replayErr, "HTTP %d for %04d-%02d-%02d", code, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
-    http.end(); return code < 0 ? -1 : 0;
+void onReplayTable(byte* payload, unsigned int len) {
+  JsonDocument doc;
+  DeserializationError e = deserializeJson(doc, payload, len);
+  if (e) { snprintf(replayErr, sizeof replayErr, "table: %s (%u B, heap %u)", e.c_str(), len, (unsigned)ESP.getMaxAllocHeap()); return; }
+  const char* b64 = doc["b64"] | "";
+  int nb = replayCur == 0 ? 1 : 0; uint8_t* b = replayBuf[nb];
+  size_t olen = 0;
+  if (mbedtls_base64_decode(b, ROWS_PER_DAY, &olen, (const unsigned char*)b64, strlen(b64)) || olen != ROWS_PER_DAY) {
+    strlcpy(replayErr, "table: bad size", sizeof replayErr); return;
   }
-  memset(buf, 255, ROWS_PER_DAY);
-  WiFiClient* st = http.getStreamPtr();
-  char line[256]; int len = 0, rows = 0; uint32_t lastData = millis();
-  while ((http.connected() || st->available()) && millis() - lastData < 15000) {
-    int c = st->read();
-    if (c < 0) { delay(5); continue; }
-    lastData = millis();
-    if (c != '\n') { if (len < (int)sizeof line - 1) line[len++] = c; continue; }
-    line[len] = 0; len = 0;
-    int hh, mm, ss; float v[12];
-    if (line[0] == '#' || strlen(line) < 20) continue;
-    if (sscanf(line + 11, "%d:%d:%d", &hh, &mm, &ss) != 3) continue;
-    char* q = strchr(line, ','); int nv = 0;
-    while (q && nv < 12) { v[nv++] = strtof(q + 1, nullptr); q = strchr(q + 1, ','); }
-    if (nv < 9) continue;
-    int idx = (hh * 3600 + mm * 60 + ss) / 10; if (idx < 0 || idx >= ROWS_PER_DAY) continue;
-    if (v[5] < 0 || v[6] < 0 || v[7] < 0 || v[8] < 0) continue;     // columns 6..9 (v is 0-based)
-    float sum = v[5] + v[6] + v[7] + v[8];
-    buf[idx] = (uint8_t)fminf(254.0f, roundf(sum)); rows++;
-  }
-  http.end();
-  return rows;
-}
-
-// background task (core 0): newest day with >= 50 % coverage among yesterday .. 3 days ago
-void replayTask(void*) {
-  for (;;) {
-    uint32_t waitMs = 15UL * 60 * 1000;                          // retry in 15 min after a failure
-    time_t now = time(nullptr);
-    if (WiFi.status() == WL_CONNECTED && now > 1700000000) {
-      time_t today0 = now - now % 86400;
-      for (int back = 1; back <= 3; back++) {
-        time_t day = today0 - back * 86400L;
-        char ds[11]; struct tm tm; gmtime_r(&day, &tm); strftime(ds, sizeof ds, "%Y-%m-%d", &tm);
-        if (!strcmp(ds, replayDay)) { waitMs = 3UL * 3600 * 1000; break; }   // already have the newest usable day
-        int nb = replayCur == 0 ? 1 : 0;
-        int rows = fetchSinpDay(day, replayBuf[nb]);
-        Serial.printf("replay: %s -> %d rows\n", ds, rows);
-        if (rows < 0) break;                                      // network trouble: retry later
-        if (rows < REPLAY_MIN_ROWS) { snprintf(replayErr, sizeof replayErr, "%s only %d rows, trying older", ds, rows); continue; }
-        uint32_t s = 0; for (int i = 0; i < ROWS_PER_DAY; i++) if (replayBuf[nb][i] != 255) s += replayBuf[nb][i];
-        portENTER_CRITICAL(&replayMux);
-        replayCur = nb; replayRows = rows; replayMean = (float)s / rows; strlcpy(replayDay, ds, sizeof replayDay);
-        portEXIT_CRITICAL(&replayMux);
-        replayFetchedMs = millis(); replayErr[0] = 0;
-        waitMs = 3UL * 3600 * 1000;
-        break;
-      }
+  int filled = 0; uint32_t sum = 0;
+  for (int i = 0; i < ROWS_PER_DAY; i++) if (b[i] != 255) { filled++; sum += b[i]; }
+  if (!filled) { strlcpy(replayErr, "table: empty", sizeof replayErr); return; }
+  // fill each empty slot from the nearest recorded one (circular, two passes)
+  static int16_t dist[ROWS_PER_DAY]; static uint8_t val[ROWS_PER_DAY];
+  for (int i = 0; i < ROWS_PER_DAY; i++) { dist[i] = b[i] != 255 ? 0 : 32767; val[i] = b[i]; }
+  for (int pass = 0; pass < 2; pass++)
+    for (int k = 0; k < 2 * ROWS_PER_DAY; k++) {
+      int i = pass == 0 ? k % ROWS_PER_DAY : (2 * ROWS_PER_DAY - 1 - k) % ROWS_PER_DAY;
+      int j = pass == 0 ? (i + ROWS_PER_DAY - 1) % ROWS_PER_DAY : (i + 1) % ROWS_PER_DAY;
+      if (dist[j] < 32767 && dist[j] + 1 < dist[i]) { dist[i] = dist[j] + 1; val[i] = val[j]; }
     }
-    vTaskDelay(pdMS_TO_TICKS(waitMs));
-  }
+  memcpy(b, val, ROWS_PER_DAY);
+  time_t built = doc["t"] | 0L; struct tm tm; gmtime_r(&built, &tm);
+  replayCur = nb; replayRows = filled; replayMean = (float)sum / filled;
+  strftime(replayDay, sizeof replayDay, "%d %b %H:%M UTC", &tm);
+  replayFetchedMs = millis(); replayErr[0] = 0;
+  Serial.printf("replay table: %d of %d slots recorded, mean %.1f particles/s\n", filled, ROWS_PER_DAY, replayMean);
 }
 
 int lastReplayIdx = -1;
@@ -413,12 +346,12 @@ void replayTick() {
   int n = b[idx];
   lastMsgMs = millis(); haveMsg = true;
   if (n == 255) return;                                         // missing row: nothing shown, nothing invented
-  // storm level: last minute (6 rows) vs the day's mean
+  // storm level: last minute (6 slots) vs the table's mean
   int s = 0, k = 0; for (int i = 0; i < 6; i++) { int j = (idx - i + ROWS_PER_DAY) % ROWS_PER_DAY; if (b[j] != 255) { s += b[j]; k++; } }
   float r = k ? (float)s / k : 0;
   replayStorm = (replayMean > 0 && r > 0) ? constrain(logf(r / replayMean) / logf(STORM_FULL_AT), 0.0f, 1.0f) : 0;
   recentN[recentHead] = n; recentHead = (recentHead + 1) % 60; if (recentLen < 60) recentLen++;
-  spawnFlashes(n, 10.0f);
+  spawnFlashes(n * 10, 10.0f);                                  // n particles/s over this 10-s slot
 }
 
 // ---------- source selection ----------
@@ -485,19 +418,18 @@ void drawOled() {
     oled.drawStr(4, 11, "TEST  synthetic data"); oled.setDrawColor(1);
   } else if (active == SRC_REPLAY) {                // equally unmistakable REPLAY banner
     oled.drawBox(0, 0, 128, 14); oled.setDrawColor(0);
-    oled.drawStr(4, 11, "REPLAY  Elektro-L2"); oled.setDrawColor(1);
+    oled.drawStr(4, 11, "REPLAY  recorded L5"); oled.setDrawColor(1);
   } else {
     oled.drawStr(0, 10, "ELEKTRO-L5 76E");
     oled.drawStr(128 - oled.getStrWidth(st) , 10, st);
   }
   char line[32];
   float r = recentRate();
-  if (active == SRC_REPLAY) { if (r >= 0) snprintf(line, sizeof line, "p9-300 %4.1f /10s", r); else snprintf(line, sizeof line, "p9-300   --"); }
-  else if (r >= 0) snprintf(line, sizeof line, "p>600 %5.1f /s", r); else snprintf(line, sizeof line, "p>600   --");
+  if (r >= 0) snprintf(line, sizeof line, "particles %5.1f/s", r); else snprintf(line, sizeof line, "particles   --");
   oled.drawStr(0, 24, line);
   time_t nowUnix = time(nullptr);
   if (testMode) snprintf(line, sizeof line, "not live: local test");
-  else if (active == SRC_REPLAY) snprintf(line, sizeof line, "day %s", replayDay);
+  else if (active == SRC_REPLAY) snprintf(line, sizeof line, "same time, earlier day");
   else if (!strcmp(st, "LOST")) snprintf(line, sizeof line, "link lost");
   else if (lastFrameUnix > 0 && nowUnix > 1700000000) snprintf(line, sizeof line, "frame %lds ago", (long)(nowUnix - lastFrameUnix));
   else snprintf(line, sizeof line, "no frame yet");
@@ -557,7 +489,7 @@ void ensureMqtt() {
   if (millis() - last < backoff && last) return; last = millis();
   String id = "ggak-esp32-" + WiFi.macAddress(); id.replace(":", "");
   if (mqtt.connect(id.c_str(), MQTT_USER, MQTT_PASS)) {
-    mqtt.subscribe(TOPIC_SEC, 0); mqtt.subscribe(TOPIC_STATUS, 0);
+    mqtt.subscribe(TOPIC_SEC, 0); mqtt.subscribe(TOPIC_STATUS, 0); mqtt.subscribe(TOPIC_REPLAY, 1);
     Serial.println("mqtt connected"); backoff = 2000;
   } else {
     Serial.printf("mqtt connect failed, state %d\n", mqtt.state());
@@ -623,12 +555,12 @@ button.on{background:#6ab0ff;color:#000;border-color:#6ab0ff}small{color:#777}
 label{display:flex;justify-content:space-between;margin-top:14px}label b{font-weight:400;font-variant-numeric:tabular-nums;color:#ff8a1e}
 input[type=range]{width:100%;accent-color:#ff8a1e}</style></head><body>
 <h1>Elektro-L5 GGAK window</h1><div id="st">…</div>
-<table><tr><td>p&gt;600 rate</td><td id="r">–</td></tr><tr><td>last frame</td><td id="f">–</td></tr>
+<table><tr><td>particle rate</td><td id="r">–</td></tr><tr><td>last frame</td><td id="f">–</td></tr>
 <tr><td>SNR</td><td id="s">–</td></tr><tr><td>IP</td><td id="ip">–</td></tr><tr><td>uptime</td><td id="u">–</td></tr></table>
 <h2>Source</h2><div id="src" style="margin-bottom:10px">–</div>
-<button id="c_auto" onclick="c('auto')">Auto</button><button id="c_live" onclick="c('live')">Live</button><button id="c_replay" onclick="c('replay')">L2 replay</button><button id="c_test" onclick="c('test')">Test</button>
-<table><tr><td>last live count</td><td id="lc">–</td></tr><tr><td>L2 replay day</td><td id="rd">–</td></tr><tr><td>L2 download</td><td id="re">–</td></tr></table>
-<p><small>Auto: live feed while it gives counts; after 5 min without, yesterday's Elektro-L2 protons from SINP at the same time of day (24 h late, labelled REPLAY); if that is missing too, random TEST data. A forced choice lasts until the next restart.</small></p>
+<button id="c_auto" onclick="c('auto')">Auto</button><button id="c_live" onclick="c('live')">Live</button><button id="c_replay" onclick="c('replay')">Replay</button><button id="c_test" onclick="c('test')">Test</button>
+<table><tr><td>last live count</td><td id="lc">–</td></tr><tr><td>replay table built</td><td id="rd">–</td></tr><tr><td>replay table</td><td id="re">–</td></tr></table>
+<p><small>The light: real particle counts from Elektro-L5's radiation monitor, about 40 a second, shown at most a few flashes a second. Which particles is not confirmed (the "protons above 600 MeV" label looks wrong; probably radiation-belt electrons). Auto: live feed while it gives counts; after 5 min without, this station's own recorded counts from the same time of day (labelled REPLAY); if that is missing too, random TEST data. A forced choice lasts until the next restart.</small></p>
 <h2>Display</h2><button id="don" onclick="d(1)">On</button><button id="doff" onclick="d(0)">Off</button>
 <p><small>Off turns the LEDs and the small screen dark. After a power cut or restart it always comes back on.</small></p>
 <h2>Look</h2><div id="sl"></div>
@@ -646,15 +578,15 @@ S.forEach(([k,,,,,fmt])=>{const i=document.getElementById('i_'+k),v=document.get
 i.oninput=()=>{busy=Date.now();v.textContent=fmt(i.value)};
 i.onchange=()=>{busy=Date.now();get('/set?'+k+'='+i.value)}});
 function show(j){st.textContent=j.state;st.className=j.state;
-r.textContent=j.rate==null?'–':j.rate.toFixed(1)+' /s';
+r.textContent=j.rate==null?'–':j.rate.toFixed(1)+' particles/s';
 f.textContent=j.frame_age==null?(j.state=='LOST'?'link lost':'none yet'):j.frame_age+' s ago';
 s.textContent=j.snr==null?'–':j.snr.toFixed(1)+' dB '+(j.lock?'lock':'no lock')+(j.rep?' · replay':'');
 ip.textContent=j.ip;u.textContent=Math.floor(j.uptime/60)+' min';
 ['auto','live','replay','test'].forEach(k=>document.getElementById('c_'+k).className=j.choice==k?'on':'');
-src.innerHTML='Showing <b class="'+j.state+'">'+({live:'LIVE feed',replay:'L2 REPLAY',test:'TEST (random)'})[j.source]+'</b>'+(j.choice=='auto'?' (auto)':' (forced)');
+src.innerHTML='Showing <b class="'+j.state+'">'+({live:'LIVE feed',replay:'REPLAY (recorded)',test:'TEST (random)'})[j.source]+'</b>'+(j.choice=='auto'?' (auto)':' (forced)');
 lc.textContent=j.live_count_age==null?'none since boot':(j.live_count_age<120?j.live_count_age+' s ago':Math.round(j.live_count_age/60)+' min ago');
-rd.textContent=j.replay.day?j.replay.day+' ('+Math.round(j.replay.rows/86.4)+' % of the day)':'none';
-re.textContent=j.replay.err?j.replay.err:(j.replay.fetched_min==null?'–':'ok, '+j.replay.fetched_min+' min ago');
+rd.textContent=j.replay.day?j.replay.day+' ('+Math.round(j.replay.rows/86.4)+' % of the day recorded)':'none';
+re.textContent=j.replay.err?j.replay.err:(j.replay.fetched_min==null?'–':'received '+j.replay.fetched_min+' min ago');
 don.className=j.display?'on':'';doff.className=j.display?'':'on';
 if(Date.now()-busy>1500)S.forEach(([k,,,,,fmt])=>{document.getElementById('i_'+k).value=j.look[k];document.getElementById('v_'+k).textContent=fmt(j.look[k])});}
 function get(u){fetch(u).then(x=>x.json()).then(show).catch(()=>{st.textContent='no reply';st.className='LOST'})}
@@ -763,10 +695,9 @@ void setup() {
   net.setCACert(CA_CERT);
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
   mqtt.setCallback(mqttCallback);
-  mqtt.setBufferSize(1024);
+  mqtt.setBufferSize(16384);                       // the retained replay table is ~11.6 KB
   mqtt.setKeepAlive(30);
   configTime(0, 0, "pool.ntp.org", "time.google.com");
-  xTaskCreatePinnedToCore(replayTask, "replay", 12288, nullptr, 1, nullptr, 0);   // SINP download, off the LED core
   ensureWifi();                                    // starts web + OTA + mDNS if already connected
   Serial.println("ggak_window ready. Serial: t=test m=map c=columns x=exit");
 }

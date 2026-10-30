@@ -6,8 +6,8 @@ sends the counts down, all day, on 1693 MHz. This repo receives that signal with
 and an RTL-SDR, decodes it live on a Raspberry Pi, publishes one message a second to a public
 feed, and drives a wall of LEDs (and a web page that clicks like a Geiger counter) from it.
 
-- **Live page, with sound:** https://gs.nl06.com/frontier/window
-- **The write-up:** https://gs.nl06.com/frontier/particle-window
+- **The write-up, with the live feed and sound at the top:** https://gs.nl06.com/frontier/particle-window
+- **Just the live window:** https://gs.nl06.com/frontier/window-live.html
 
 Three things this data shows (scripts and data are here, so you can check them):
 
@@ -28,18 +28,33 @@ mosquitto_sub -h z5166a1e.ala.asia-southeast1.emqxsl.com -p 8883 --capath /etc/s
   -u ggak-public -P M27enNeGa2DH8w9 -t ggak/l5/sec
 ```
 
+The `ggak-public` login is public on purpose. It can only subscribe to `ggak/l5/sec`, `ggak/l5/status`
+and `ggak/l5/replay`: publishing and wildcard subscriptions are refused by the broker.
+
 (On macOS use `--cafile /etc/ssl/cert.pem` instead of `--capath`. WebSockets: port 8084, path `/mqtt`.)
 
 One message a second:
 
 ```
 {"t":1793098256,"rx":1793098236,"src":"live","p600":82,"p800":40,"p1100":12,
- "frames":3,"csum_fail":1,"snr":10.4,"lock":true}
+ "frames":3,"csum_fail":1,"snr":10.4,"lock":true,"pc":0,"pc_rec":3}
 ```
 
-`rx` is the second the counts describe (Unix time, ~20 s before `t`). Counts are raw (doubled), or
-`null` when no checksum-verified reading covers that second. `"rep":true` marks counts from a
-soft-repaired frame.
+`rx` is the second the counts describe (Unix time, ~20 s before `t`). `p600`, `p800` and `p1100` are
+raw counts (doubled, so `p600 / 2` is particles that second), or `null` when no checksum-verified
+reading covers that second. `"rep":true` marks counts from a soft-repaired frame. The names are the
+labels from SatDump PR #1143; finding 2 is why we no longer call them protons.
+
+`pc` is a separate, much rarer stream: candidate proton hits from the SKL spectrometer records
+(`pc_rec` = records seen that second). About one hit every 7 to 23 minutes, unvalidated until a solar
+proton event shows up in it.
+
+Two more topics:
+
+- `ggak/l5/status` (retained, every 10 s): receiver state, SNR, software version.
+- `ggak/l5/replay` (retained, every 10 min): a day of particles per second in 8,640 ten-second slots,
+  built from the station's own recordings (each slot keeps its latest reading from the last 72 h).
+  Base64 bytes, 255 = no reading. The window plays it when the live feed is quiet.
 
 ## 2. Decode a real recording (5 minutes)
 
@@ -89,7 +104,8 @@ sudo cp decoder/ggak-live.service decoder/ggak-pub.service /etc/systemd/system/ 
 ```
 
 `ggak_live.py` runs `rtl_tcp`, records, decodes and writes frames; `ggak_pub.py` turns them into
-the per-second feed (it needs your own broker in `mqtt.json`).
+the per-second feed and the replay table (it needs your own broker in `mqtt.json`). The Pi only makes
+outgoing connections: nothing reaches it from the internet.
 
 Things that cost days:
 
@@ -107,10 +123,14 @@ Things that cost days:
 ## 5. Build the window
 
 `firmware/ggak_window/` is an Arduino sketch for an ESP32 DevKit, two 60-LED WS2812B strips behind
-two 25 cm box frames, an SSD1306 SPI screen and a 5 V 3 A supply. One count lights one LED, full
-on then fading; the fade is quick in a storm and slow when quiet. If the live feed gives no count
-for 5 minutes it plays the previous day's Elektro-L2 protons from SINP (labelled REPLAY), then
-random test data (labelled TEST). Fill in your Wi-Fi at the top. Board "ESP32 Dev Module",
+two 25 cm box frames, an SSD1306 SPI screen and a 5 V 3 A supply. One particle lights one LED, in
+one colour, full on then fading; the fade is quick in a storm and slow when quiet. If the live feed
+gives no count for 5 minutes it plays the station's own recorded counts for the same time of day
+from `ggak/l5/replay` (labelled REPLAY), and if it has none, random test data (labelled TEST).
+
+It joins Wi-Fi first and serves a control page at `http://ggak-window.local` to anyone on the same
+network: brightness, flash rate, fade times, display on/off (always back on after a power cut) and
+the data source. Fill in your Wi-Fi and an upload password at the top. Board "ESP32 Dev Module",
 partition scheme "Minimal SPIFFS (1.9MB APP with OTA)".
 
 ## What is not known
@@ -122,8 +142,10 @@ partition scheme "Minimal SPIFFS (1.9MB APP with OTA)".
 
 ## Credits
 
-SatDump PR #1143 (the counter layout). SINP, Moscow State University (Elektro-L2 data). NOAA SWPC
-(GOES data). Our earlier Elektro-L2 decode and the first L5 catch are written up at
-https://gs.nl06.com/frontier.
+SatDump PR #1143 by petrvosahlocom (May 2026): the GGAK frame and instrument layout, including the
+channel labels questioned above. Aweeri: the Elektro-L2 recording behind our first decode.
+SINP, Moscow State University: the published Elektro-L2 data we validated that decode against.
+NOAA SWPC: GOES data. Our Elektro-L2 decode (June 2026) and first Elektro-L5 catch (July 2026) are
+written up at https://gs.nl06.com/frontier.
 
 MIT licence.
